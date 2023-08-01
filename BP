@@ -1,0 +1,551 @@
+# -*- coding: utf-8 -*-
+import pickle
+import time
+import random
+from matplotlib import pyplot as plt
+from scipy.interpolate import lagrange
+import numpy as np
+import torch
+import torch.nn as nn
+
+from My_utils.evaluation_scheme import evaluation
+from My_utils.preprocess_data import  divide_data
+import torch.utils.data as Data
+from torch.utils.data import RandomSampler, DataLoader
+import pytorch_warmup as warmup
+
+
+#%%
+def process_data(car_data,soc_min,soc_max,ava_len):
+    """abnormal values"""
+    Veh_state = car_data[car_data['车辆状态'].isin([1])]  # 1 indicate run
+    Run_state = Veh_state[Veh_state['运行模式'].isin([1])]  # 1 indicate pure electric
+    Nocharge = Run_state[Run_state['充电状态'].isin([3])]  #
+    NO_min = Nocharge[Nocharge['SOC'] >= soc_min]
+    NO_max = NO_min[NO_min['SOC'] <= soc_max]
+    '''search'''
+    data = NO_max['SOC'].values
+    dif_data = np.diff(data)
+    index = np.where(dif_data > 5)  # recharge exist so at least 20%
+    index_2 = index[0].tolist()
+    index_2.insert(0, 0)
+    index_2.insert(-1, -1)
+
+    my_data = np.nan_to_num(NO_max.values[:, :-9])
+
+    # %
+    snapshot = []
+    for i in range(len(index_2) - 2):
+        snapshot.append(my_data[index_2[i]:index_2[i + 1], :])
+
+    # %
+    del_index = []
+    for i in range(len(snapshot)):
+        length = len(snapshot[i])
+        if length <= ava_len :
+            del_index.append(i)
+        else:
+            pass
+
+    for i in range(len(del_index)):
+        del snapshot[del_index[i] - i]  # del snapshot that less than 100
+
+    return snapshot
+
+
+
+#%%
+# data=np.load('4-SOC_prediction/car_data.npy',allow_pickle=True)
+data=np.load('4-SOC_prediction/car_data_B.npy',allow_pickle=True)
+
+car_data1=data[0]
+car_data2=data[1]
+car_data3=data[2]
+car_data4=data[3]
+car_data5=data[4]
+
+
+snapshot1=process_data(car_data1,10,90,180)
+snapshot2=process_data(car_data2,10,90,180)
+snapshot3=process_data(car_data3,10,90,180)
+snapshot4=process_data(car_data4,10,90,180)
+snapshot5=process_data(car_data5,10,90,180)
+#%%
+"""MCS"""
+np.random.seed(42)
+random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+def monte_carlo_sampling(lst, num_samples):
+    rand_idx = np.random.choice(len(lst), num_samples, replace=False)
+    samples = [lst[i] for i in rand_idx]
+    # 在原始list中删除采样样本
+    lst = [item for i, item in enumerate(lst) if i not in rand_idx]
+
+    return samples,lst
+
+num_samples=20
+
+samples1, lst1 = monte_carlo_sampling(snapshot1, num_samples)
+samples2, lst2 = monte_carlo_sampling(snapshot2, num_samples)
+samples3, lst3 = monte_carlo_sampling(snapshot3, num_samples)
+samples4, lst4 = monte_carlo_sampling(snapshot4, num_samples)
+samples5, lst5 = monte_carlo_sampling(snapshot5, num_samples)
+
+#%%
+# snapshot=snapshot1+snapshot2+snapshot3+snapshot4+snapshot5
+snapshot=lst1+lst2+lst3+lst4+lst5
+"""打乱5辆车"""
+np.random.seed(42)
+random.seed(42)
+random.shuffle(snapshot)
+data=np.vstack(snapshot)
+data_no_time=data[:,1:].astype(float)
+
+
+#%%
+
+with open('4-SOC_prediction/models/coFUN_A.pkl', 'rb') as file:
+    efficiency_matrix_A = pickle.load(file)
+
+with open('4-SOC_prediction/models/coFUN_B.pkl', 'rb') as file:
+    efficiency_matrix_B = pickle.load(file)
+
+
+def ECR_A(speed, soc):
+    if speed <= 110 and soc >= 10 and soc <= 90:
+        return efficiency_matrix_A[speed, soc - 10]  # Return the average efficiency if outside the range
+    else:
+        return np.mean(efficiency_matrix_A)
+
+
+def ECR_B(speed, soc):
+    if speed <= 122 and soc >= 10 and soc <= 90:
+        return efficiency_matrix_B[speed, soc - 10]  # Return the average efficiency if outside the range
+    else:
+        return np.mean(efficiency_matrix_B)
+# %%
+Capacity_A = 60
+Capacity_B = 87
+ave_ECR_A=0.21
+ave_ECR_B=0.22
+Range_limt_A=270
+Range_limt_B=360
+#%%
+def feature_formation(snapshot, ave_EC, Capacity, limt, coFUN):
+    """feature formation"""
+
+    """(0)RDR"""
+    R = []
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:].astype(float)  # exclude timestamp and first/last point
+        r = (temp[-1, 5] - temp[:, 5] + temp[-1, 8] * Capacity / ave_EC / 100)
+
+        R.append(r)  # no estimated res
+
+    RDR = np.hstack(R)
+    indices = np.where(RDR > limt)
+
+    RDR = np.delete(RDR, indices[0], axis=0)
+    RDR_mean = np.mean(RDR)
+    RDR_std = np.std(RDR)
+    RDR_Z = (RDR - RDR_mean) / RDR_std
+    #
+    """(1)speed"""
+    SP = []
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:]  # exclude timestamp and first/last point
+        speed = temp[:, 1].astype(float)
+        zeros_idx = np.where(speed == 0)[0]
+        for idx in zeros_idx:
+            # 找到前后不为0的值所在位置
+            left_idx = idx - 1
+            while left_idx >= 0 and speed[left_idx] == 0:
+                left_idx -= 1
+            right_idx = idx + 1
+            while right_idx < len(speed) and speed[right_idx] == 0:
+                right_idx += 1
+            # 如果前后都有非0值，则进行插值替换
+            if left_idx >= 0 and right_idx < len(speed):
+                x = np.array([left_idx, right_idx])
+                y = speed[x]
+                speed[idx] = lagrange(x, y)(idx)
+
+        SP.append(speed)  #
+
+    SP = np.hstack(SP)
+    SP = np.delete(SP, indices[0], axis=0)
+    SP_mean = np.mean(SP)
+    SP_std = np.std(SP)
+    SP_Z = (SP - SP_mean) / SP_std
+    #
+
+    """(2)SOC  ni linspace"""
+    S = []
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:]  # exclude timestamp and first/last point
+        s = temp[:, 8].astype(float)
+
+        S.append(s)  #
+
+    SOC = np.hstack(S)
+    SOC = np.delete(SOC, indices[0], axis=0)
+
+    SOC_Z = SOC/100
+
+    #
+    """(3)SOH"""
+    M = []
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:]  # exclude timestamp and first/last point
+        m = 0.8 + 0.2 * (1 - temp[:, 5] / 1500000)
+        M.append(m)  #
+    SOH = np.hstack(M)
+    SOH = np.delete(SOH, indices[0], axis=0)
+
+    SOH_Z = SOH
+
+    """(4)SOE"""
+    SOE_Z = SOC/100 * SOH
+
+    #
+    """(5)ECR"""
+    if coFUN == 1:
+        func = ECR_A
+    else:
+        func = ECR_B
+    ecr = []
+    for i in range(len(SP)):
+        ecr.append(func(np.ceil(SP.reshape(-1, 1)[i]).astype(int), SOC.reshape(-1, 1)[i].astype(int)))
+
+    ECR = np.hstack(ecr)
+
+    ECR_mean = np.mean(ECR, axis=0)
+    ECR_std = np.std(ECR, axis=0)
+    ECR_Z = (ECR - ECR_mean) / ECR_std
+    #
+    """(6)auxiliary info"""
+    A = []  # 电压电流 单体最大最小电压 最大最小温度
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:]  # exclude timestamp and first/last point
+        a = temp[:, [6, 7, 16, 19, 22, 25]].astype(float)
+        A.append(a)  # no estimated res
+
+    AU = np.vstack(A)
+    AU = np.delete(AU, indices[0], axis=0)
+    AU_mean = np.mean(AU, axis=0)
+    AU_std = np.std(AU, axis=0)
+    AU_Z = (AU - AU_mean) / AU_std
+
+    # Construct the feature matrix
+    Data_set = np.concatenate((RDR_Z.reshape(-1, 1),
+                               ECR_Z.reshape(-1, 1),
+                               SOE_Z.reshape(-1, 1),
+                               SOH_Z.reshape(-1, 1),
+                               SOC_Z.reshape(-1, 1),
+                               SP_Z.reshape(-1, 1),
+                               AU_Z), axis=1).astype(float)
+
+    return Data_set,RDR_std,RDR_mean
+
+#%%
+# Data_set,_,_ = feature_formation(snapshot, ave_ECR_A, Capacity_A, Range_limt_A, 1)
+Data_set,_,_ = feature_formation(snapshot, ave_ECR_B, Capacity_B, Range_limt_B, 2)
+#%%
+"""hyper paras:"""
+train_size=int(0.9*len(Data_set))
+seq_len=1
+pre_len=1
+batch_size=128
+#%%
+trainX=torch.tensor(Data_set[:train_size,1:]).unsqueeze(2).float()
+trainY=torch.tensor(Data_set[:train_size,0]).unsqueeze(1).unsqueeze(2).float()
+testX=torch.tensor(Data_set[train_size+1:,1:]).unsqueeze(2).float()
+testY=torch.tensor(Data_set[train_size+1:,0]).unsqueeze(1).unsqueeze(2).float()
+
+train_dataset = Data.TensorDataset(trainX, trainY)
+dataloaders_train = Data.DataLoader(dataset=train_dataset,
+                                batch_size=batch_size, shuffle=True,
+                                generator=torch.Generator().manual_seed(42))
+
+test_dataset = Data.TensorDataset(testX, testY)
+dataloaders_valid= Data.DataLoader(dataset=test_dataset,
+                                    batch_size=batch_size,
+                                    shuffle=False)
+#%%
+class BPNN(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super().__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+
+        self.tansig = nn.Tanh()
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.purlin = nn.PReLU()
+        self.fc3 = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        out = self.fc1(x)
+        out = self.tansig(out)
+        # out = self.fc2(out)
+        # out = self.purlin(out)
+        # out = self.fc2(out)
+        # out = self.purlin(out)
+        out = self.fc3(out)
+        return  torch.mean(out,dim=1)
+
+def print_grad_norms(model):
+    total_norm = 0.0
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.grad is not None:
+            param_norm = param.grad.norm(2)
+            total_norm += param_norm.item() ** 2
+            print(f"{name}: {param_norm:.3f}")
+    total_norm = total_norm ** 0.5
+    print(f"Total norm: {total_norm:.3f}")
+
+def count_parameters(model):
+    """
+    计算PyTorch模型的参数量。
+    """
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+# %%
+def train_model(T_model,dataloaders_train,dataloaders_valid,epochs,optimizer,criterion):
+    best_val_loss = float("inf")
+    best_model = None
+    #           train
+    train_loss_all = []
+    T_model.train()  # Turn on the train mode
+    total_loss = 0.
+
+    for epoch in range(epochs):
+        train_loss = 0
+        train_num = 0
+        for step, (x, y) in enumerate(dataloaders_train):
+
+            time_start = time.time()
+
+            optimizer.zero_grad()
+
+            x, y = x.to(device), y.to(device)
+
+            pre_y = T_model(x.squeeze(2))
+
+            loss = criterion(pre_y.unsqueeze(1).unsqueeze(2), y)
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(T_model.parameters(), 0.1)  # 梯度裁剪，放backward和step直接
+            optimizer.step()
+
+            with warmup_scheduler.dampening():
+                scheduler.step()
+
+            train_loss += loss.item() * x.size(0)
+            train_num += x.size(0)
+
+            time_end = time.time()
+            time_c = (time_end - time_start) * 100
+
+            total_loss += loss.item()
+            log_interval = int(len(trainX) / batch_size / 5)
+            if (step + 1) % log_interval == 0 and (step + 1) > 0:
+                cur_loss = total_loss / log_interval
+                print('| epoch {:3d} | {:5d}/{:5d} batches | '
+                      'lr {:02.6f} | '
+                      'loss {:5.5f} | time {:8.2f}'.format(
+                    epoch, (step + 1), len(trainX) // batch_size, scheduler.get_last_lr()[0],
+                    cur_loss, time_c))
+                total_loss = 0
+
+        if (epoch + 1) % 5 == 0:
+            print('-' * 89)
+            print('end of epoch: {}, Loss:{:.7f}'.format(epoch + 1, loss.item()))
+            print('-' * 89)
+            train_loss_all.append(train_loss / train_num)
+
+            # print_grad_norms(T_model)  ##
+
+        # 验证阶段
+        T_model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for i, (data, target) in enumerate(dataloaders_valid):
+                data, target = data.to(device), target.to(device)
+                output = T_model(data.squeeze(2))
+                val_loss += criterion(output.unsqueeze(1).unsqueeze(2), target).item()
+
+        T_model.train()  # 将模型设置回train()模式
+
+        print('Epoch: {} Validation Loss: {:.6f}'.format(epoch + 1, val_loss / train_num))
+
+        if val_loss / train_num < best_val_loss:
+            best_val_loss = val_loss / train_num
+            best_model = T_model
+            print('best_Epoch: {} Validation Loss: {:.6f}'.format(epoch + 1, best_val_loss))
+
+
+    return best_model,best_val_loss
+# %%
+start = time.time()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+np.random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+
+
+BP_Net = BPNN(11, 8, 1).to(device)
+
+optimizer = torch.optim.AdamW(BP_Net.parameters(), lr=0.05,
+                              betas=(0.9, 0.9999), weight_decay=1e-4)
+num_steps = len(dataloaders_train) * 400
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps)
+
+warmup_scheduler = warmup.UntunedLinearWarmup(optimizer)
+criterion = nn.MSELoss()
+
+best_model, best_val_loss = train_model(BP_Net, dataloaders_train, dataloaders_valid,
+                                        5, optimizer, criterion)
+
+end = time.time()
+
+print (str(end-start))
+#%%
+# torch.save(best_model.state_dict(), '4-SOC_prediction/models/BP_Net.pth')
+# torch.save(best_model.state_dict(), '4-SOC_prediction/models/BP_Net_B.pth')
+
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# BP_Net_dict = torch.load('4-SOC_prediction/models/BP_Net.pth')
+# best_model = BPNN().to(device)
+# best_model.load_state_dict(BP_Net_dict)
+#%% test
+
+#%%
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# BP_Net_dict = torch.load('4-SOC_prediction/models/BP_Net.pth')
+# BP = BPNN(11,4,1).to(device)
+# BP.load_state_dict(BP_Net_dict)
+# BP.eval()
+
+
+BP_Net_dict_B = torch.load('4-SOC_prediction/models/BP_Net_B.pth')
+BP_B = BPNN(11,8,1).to(device)
+BP_B.load_state_dict(BP_Net_dict_B)
+BP_B.eval()
+
+
+#%%
+
+start = time.time()
+
+sample_snapshot = samples1 + samples2 + samples3 + samples4 + samples5
+
+# car, RDR_std, RDR_mean = feature_formation(sample_snapshot, ave_ECR_A, Capacity_A, Range_limt_A, 1)
+car,RDR_std,RDR_mean = feature_formation(sample_snapshot, ave_ECR_B, Capacity_B, Range_limt_B, 2)
+
+trainX1 = torch.tensor(car[:, 1:]).unsqueeze(2).float()
+trainY1 = torch.tensor(car[:, 0]).unsqueeze(1).unsqueeze(2).float()
+
+batch_size = 128
+
+train_dataset1 = Data.TensorDataset(trainX1, trainY1)
+
+car_test = Data.DataLoader(dataset=train_dataset1,
+                           batch_size=batch_size, shuffle=False)
+
+all_simu = []
+all_real = []
+for i, (x, y) in enumerate(car_test):
+    # pred = BP(x.squeeze(2).to(device)).float()
+    pred = BP_B(x.squeeze(2).to(device)).float()
+
+    Norm_pred = pred.data.cpu().numpy()
+    all_simu.append(Norm_pred.reshape(-1, 1))
+    all_real.append(y.squeeze(1))
+
+Preds = np.vstack(all_simu) * RDR_std + RDR_mean
+GT = np.vstack(all_real) * RDR_std + RDR_mean
+
+evaluation(GT, Preds)
+end = time.time()
+
+# print (str(end-start))
+print ((end-start)/len(GT)*100000)
+evaluation(GT, Preds)
+#%%
+"""search"""
+sample_snapshot = samples1 + samples2 + samples3 + samples4 + samples5
+
+car, RDR_std, RDR_mean = feature_formation(sample_snapshot, ave_ECR_A, Capacity_A, Range_limt_A, 1)
+# car,RDR_std,RDR_mean = feature_formation(sample_snapshot, ave_ECR_B, Capacity_B, Range_limt_B, 2)
+
+trainX1 = torch.tensor(car[:, 1:]).unsqueeze(2).float()
+trainY1 = torch.tensor(car[:, 0]).unsqueeze(1).unsqueeze(2).float()
+
+batch_size = 128
+
+train_dataset1 = Data.TensorDataset(trainX1, trainY1)
+
+car_test = Data.DataLoader(dataset=train_dataset1,
+                           batch_size=batch_size, shuffle=False)
+
+
+N_values = [ 2,4,8,16,32]
+LR_values = [0.05]
+results = {}
+for N in N_values:
+    for LR in LR_values:
+
+        BP_Net = BPNN(11, N, 1).to(device)
+
+        optimizer = torch.optim.AdamW(BP_Net.parameters(), lr=LR,
+                                      betas=(0.9, 0.9999), weight_decay=1e-4)
+        num_steps = len(dataloaders_train) * 400
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps)
+
+        warmup_scheduler = warmup.UntunedLinearWarmup(optimizer)
+        criterion = nn.MSELoss()
+
+        best_model, best_val_loss = train_model(BP_Net, dataloaders_train, dataloaders_valid,
+                                                10, optimizer, criterion)
+
+        del BP_Net
+
+
+        best_model.eval()
+        all_simu = []
+        all_real = []
+        for i, (x, y) in enumerate(car_test):
+            pred = best_model(x.squeeze(2).to(device)).float()
+
+            Norm_pred = pred.data.cpu().numpy()
+            all_simu.append(Norm_pred.reshape(-1,1))
+            all_real.append(y.squeeze(1))
+
+        Preds = np.vstack(all_simu) * RDR_std + RDR_mean
+        GT = np.vstack(all_real) * RDR_std + RDR_mean
+
+        evaluation_score = evaluation(GT, Preds)[0]
+        results[(N, LR)] = evaluation_score
+
+# Extract the values from the dictionary
+evaluation_scores = list(results.values())
+
+# Convert the list to a NumPy array
+evaluation_array = np.array(evaluation_scores)
+evaluation_array
+# # Reshape the array into a 4x5 array
+# AResult_array = evaluation_array.reshape(5, 4).T
+# AResult_array
+
+
+
+#%%
+#%%
+# np.save('4-SOC_prediction/plot_data/BP_Preds_A.npy', Preds)
+# np.save('4-SOC_prediction/plot_data/BP_GT_A.npy', GT)
+#%%
+np.save('4-SOC_prediction/plot_data/BP_Preds_B.npy', Preds)
+np.save('4-SOC_prediction/plot_data/BP_GT_B.npy', GT)
+
+
+
