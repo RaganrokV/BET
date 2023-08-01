@@ -1,4 +1,10 @@
 # BET
+
+This is merely the initial version provided for pre-review evaluation.
+
+We humbly acknowledge that the current version in the repository contains code redundancy and lacks readability. Nonetheless, we are committed to maintaining and improving this repository continuously. Our goal is for the BET model and the replicated models within the repository to facilitate fair comparisons in RDR prediction.
+
+
 A deep learning model: balanced ensemble transformer(BET) for remaning driving range prediction of electric vehicle
 
 
