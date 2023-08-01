@@ -1,0 +1,316 @@
+# -*- coding: utf-8 -*-
+import pandas as pd
+import random
+from matplotlib import pyplot as plt
+from scipy.interpolate import lagrange
+from My_utils.evaluation_scheme import evaluation
+from My_utils.preprocess_data import  divide_data
+import numpy as np
+import torch
+import warnings
+warnings.filterwarnings("ignore")
+import time
+#%%
+def process_data(car_data,soc_min,soc_max,ava_len):
+    """abnormal values"""
+    Veh_state = car_data[car_data['车辆状态'].isin([1])]  # 1 indicate run
+    Run_state = Veh_state[Veh_state['运行模式'].isin([1])]  # 1 indicate pure electric
+    Nocharge = Run_state[Run_state['充电状态'].isin([3])]  #
+    NO_min = Nocharge[Nocharge['SOC'] >= soc_min]
+    NO_max = NO_min[NO_min['SOC'] <= soc_max]
+    '''search'''
+    data = NO_max['SOC'].values
+    dif_data = np.diff(data)
+    index = np.where(dif_data > 5)  # recharge exist so at least 20%
+    index_2 = index[0].tolist()
+    index_2.insert(0, 0)
+    index_2.insert(-1, -1)
+
+    my_data = np.nan_to_num(NO_max.values[:, :-9])
+
+    # %
+    snapshot = []
+    for i in range(len(index_2) - 2):
+        snapshot.append(my_data[index_2[i]:index_2[i + 1], :])
+
+    # %
+    del_index = []
+    for i in range(len(snapshot)):
+        length = len(snapshot[i])
+        if length <= ava_len :
+            del_index.append(i)
+        else:
+            pass
+
+    for i in range(len(del_index)):
+        del snapshot[del_index[i] - i]  # del snapshot that less than 100
+
+    return snapshot
+
+
+#%%
+# data=np.load('4-SOC_prediction/car_data.npy',allow_pickle=True)
+data=np.load('4-SOC_prediction/car_data_B.npy',allow_pickle=True)
+car_data1=data[0]
+car_data2=data[1]
+car_data3=data[2]
+car_data4=data[3]
+car_data5=data[4]
+#%%
+snapshot1=process_data(car_data1,10,90,180)
+snapshot2=process_data(car_data2,10,90,180)
+snapshot3=process_data(car_data3,10,90,180)
+snapshot4=process_data(car_data4,10,90,180)
+snapshot5=process_data(car_data5,10,90,180)
+#%%
+"""MCS"""
+np.random.seed(42)
+random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+def monte_carlo_sampling(lst, num_samples):
+    rand_idx = np.random.choice(len(lst), num_samples, replace=False)
+    samples = [lst[i] for i in rand_idx]
+    # 在原始list中删除采样样本
+    lst = [item for i, item in enumerate(lst) if i not in rand_idx]
+
+    return samples,lst
+
+num_samples=20
+
+samples1, lst1 = monte_carlo_sampling(snapshot1, num_samples)
+samples2, lst2 = monte_carlo_sampling(snapshot2, num_samples)
+samples3, lst3 = monte_carlo_sampling(snapshot3, num_samples)
+samples4, lst4 = monte_carlo_sampling(snapshot4, num_samples)
+samples5, lst5 = monte_carlo_sampling(snapshot5, num_samples)
+
+#%%
+# snapshot=snapshot1+snapshot2+snapshot3+snapshot4+snapshot5
+snapshot=lst1+lst2+lst3+lst4+lst5
+"""打乱5辆车"""
+np.random.seed(42)
+random.seed(42)
+random.shuffle(snapshot)
+data=np.vstack(snapshot)
+data_no_time=data[:,1:].astype(float)
+#%%
+EC=[]
+init_SOC=[]
+for i in range(len(snapshot)):
+    B =  snapshot[i][1:-1, 1:]  # DEL FIRST AND LAST and first colonm
+    RANGES = B[-1, 5] - B[0, 5]
+    SOC = B[0, 8] - B[-1, 8]
+    EC.append(RANGES / SOC)
+    init_SOC.append(B[0, 8])
+
+EC=np.vstack(EC)
+init_SOC=np.vstack(init_SOC)
+ave_EC=np.mean(EC)
+print(ave_EC)
+
+
+#%%
+
+
+
+EC_AND_SPPED=[]
+for i in range(len(snapshot)):
+    temp=snapshot[i][:,[2,6,9]]
+    df = pd.DataFrame(temp, columns=['speed', 'DDPSOC', 'soc'])
+    result = df.groupby('soc').agg({'speed': 'mean',
+                                    'DDPSOC': lambda x: x.iloc[-1] - x.iloc[0]})
+
+    EC_AND_SPPED.append(result)
+
+EC_V_raw = pd.concat(EC_AND_SPPED, axis=0)
+
+EC_V=EC_V_raw[(EC_V_raw['DDPSOC'] >= 0.1) & (EC_V_raw['DDPSOC'] <= 10)]
+
+
+EC_V['Counts']=np.ceil(EC_V['speed']).astype(int)
+grouped = EC_V.groupby('Counts')['DDPSOC'].mean()
+counts = EC_V['Counts'].value_counts().sort_index()
+#%%
+"""4-order achieve best r2 in my dataset, you can adjust it"""
+
+start = time.time()
+x=range(len(grouped))
+y=grouped
+p = np.polyfit(x, y, 6)
+"""V2EC:energy consumption model"""
+V2EC = np.poly1d(p)
+r = np.corrcoef(y, V2EC(x))[0, 1]
+r_square = r ** 2
+print(r_square)
+
+end = time.time()
+
+print (str(end-start))
+#%%
+
+#%% test
+"""feature formation"""
+def get_data(snapshot):
+    """(0)RDR"""
+    R = []
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:].astype(float)  # exclude timestamp and first/last point
+        r = (temp[-1, 5] - temp[:, 5] + ave_EC * temp[-1, 8])
+
+        R.append(r)  # no estimated res
+
+    RDR = np.hstack(R)
+    indices = np.where(RDR > 360)
+
+    RDR = np.delete(RDR, indices[0], axis=0)
+    RDR_mean = np.mean(RDR)
+    RDR_std = np.std(RDR)
+    RDR_Z = (RDR - RDR_mean) / RDR_std
+    #
+    """(1)speed"""
+    SP = []
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:]  # exclude timestamp and first/last point
+        speed = temp[:, 1].astype(float)
+        zeros_idx = np.where(speed == 0)[0]
+        for idx in zeros_idx:
+            # 找到前后不为0的值所在位置
+            left_idx = idx - 1
+            while left_idx >= 0 and speed[left_idx] == 0:
+                left_idx -= 1
+            right_idx = idx + 1
+            while right_idx < len(speed) and speed[right_idx] == 0:
+                right_idx += 1
+            # 如果前后都有非0值，则进行插值替换
+            if left_idx >= 0 and right_idx < len(speed):
+                x = np.array([left_idx, right_idx])
+                y = speed[x]
+                speed[idx] = lagrange(x, y)(idx)
+
+        SP.append(speed)  #
+
+    SP = np.hstack(SP)
+    SP = np.delete(SP, indices[0], axis=0)
+    SP_mean = np.mean(SP)
+    SP_std = np.std(SP)
+    SP_Z = (SP - SP_mean) / SP_std
+    #
+    """(2)SOC  ni linspace"""
+    S = []
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:]  # exclude timestamp and first/last point
+        s = temp[:, 8].astype(float)
+
+        S.append(s)  #
+
+    SOC = np.hstack(S)
+    SOC = np.delete(SOC, indices[0], axis=0)
+    SOC_mean = np.mean(SOC)
+    SOC_std = np.std(SOC)
+    SOC_Z = (SOC - SOC_mean) / SOC_std
+
+    #
+    """(3)mileage  degradation"""
+    M = []
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:]  # exclude timestamp and first/last point
+        m=  temp[:, 5]
+        M.append(m) # no estimated res
+    Mileage=np.hstack(M)
+    Mileage = np.delete(Mileage, indices[0], axis=0)
+    Mileage_mean = np.mean(Mileage)
+    Mileage_std = np.std(Mileage)
+    Mileage_Z=(Mileage-Mileage_mean)/Mileage_std
+    #
+    """(4)physical estimated RDR"""
+    P = []
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:]  # exclude timestamp and first/last point
+        p = temp[:, 8] * ave_EC
+        P.append(p)  # no estimated res
+    PE = np.hstack(P)
+    PE = np.delete(PE, indices[0], axis=0)
+    PE_mean = np.mean(PE)
+    PE_std = np.std(PE)
+    PE_Z = (PE - PE_mean) / PE_std
+    #
+    """(5)improved PE"""
+
+    def moving_average(arr, window_size):
+        cumsum = np.cumsum(np.insert(arr, 0, 0))
+        return (cumsum[window_size:] - cumsum[:-window_size]) / window_size
+
+    avg_length = sum(len(arr) for arr in snapshot) / len(snapshot)
+
+    def replace_with_ma(arr, window_size=int(avg_length)):
+        ma = moving_average(arr, window_size)
+        ma = np.concatenate([np.zeros(window_size-1), ma])
+        return ma
+    new_SP = replace_with_ma(SP)
+
+    IEC=V2EC(new_SP)
+    """replace speed 0"""
+
+    IEC[IEC==IEC[0]] = ave_EC
+    IPE=IEC*SOC
+
+    IPE_mean = np.mean(IPE,axis=0)
+    IPE_std = np.std(IPE,axis=0)
+    IPE_Z=(IPE-IPE_mean)/IPE_std
+
+    EC_mean = np.mean(IEC,axis=0)
+    EC_std = np.std(IEC,axis=0)
+    EC_Z=(IEC-EC_mean)/EC_std
+    #
+    """(6)auxiliary info"""
+    A = []  # 电流电压 单体最大最小电压 最大最小温度
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:]  # exclude timestamp and first/last point
+        a = temp[:, [6, 7, 16, 19, 22, 25]].astype(float)
+        A.append(a)  # no estimated res
+
+    AU = np.vstack(A)
+    AU = np.delete(AU, indices[0], axis=0)
+    AU_mean = np.mean(AU, axis=0)
+    AU_std = np.std(AU, axis=0)
+    AU_Z = (AU - AU_mean) / AU_std
+
+    car = np.concatenate(( AU_Z,
+                           SP_Z.reshape(-1, 1),
+                           SOC_Z.reshape(-1, 1),
+                           Mileage_Z.reshape(-1, 1),
+                           EC_Z.reshape(-1, 1),
+                           RDR_Z.reshape(-1, 1)), axis=1).astype(float)
+
+
+
+    return car,RDR_std,RDR_mean,EC_std,EC_mean,SOC_std,SOC_mean
+#%%
+start = time.time()
+
+sample_snapshot=samples1+samples2+samples3+samples4+samples5
+
+"""sample"""
+car, RDR_std, RDR_mean, EC_std, EC_mean, SOC_std, SOC_mean = get_data(sample_snapshot)
+
+trainX1 = torch.tensor(car[:, :-1]).unsqueeze(2).float()
+trainY1 = torch.tensor(car[:, -1]).unsqueeze(1).unsqueeze(2).float()
+
+X, Y = np.array(trainX1).squeeze(), np.array(trainY1).squeeze()
+
+
+
+GT = Y.reshape(-1, 1) * RDR_std + RDR_mean
+Preds= (X[:, -1].reshape(-1, 1) * EC_std + EC_mean) * (
+        X[:, -3].reshape(-1, 1) * SOC_std + SOC_mean)
+
+
+
+end = time.time()
+
+print (str(end-start))
+evaluation(GT, Preds)
+
+
+
+
