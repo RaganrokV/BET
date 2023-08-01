@@ -1,0 +1,443 @@
+# -*- coding: utf-8 -*-
+import pickle
+import random
+from matplotlib import pyplot as plt
+from scipy.interpolate import lagrange
+import numpy as np
+import torch
+
+import joblib
+from My_utils.evaluation_scheme import evaluation
+from My_utils.preprocess_data import  divide_data
+import scipy.optimize as optimize
+import xgboost as xgb
+import warnings
+import time
+warnings.filterwarnings("ignore")
+#%%
+def process_data(car_data,soc_min,soc_max,ava_len):
+    """abnormal values"""
+    Veh_state = car_data[car_data['车辆状态'].isin([1])]  # 1 indicate run
+    Run_state = Veh_state[Veh_state['运行模式'].isin([1])]  # 1 indicate pure electric
+    Nocharge = Run_state[Run_state['充电状态'].isin([3])]  #
+    NO_min = Nocharge[Nocharge['SOC'] >= soc_min]
+    NO_max = NO_min[NO_min['SOC'] <= soc_max]
+    '''search'''
+    data = NO_max['SOC'].values
+    dif_data = np.diff(data)
+    index = np.where(dif_data > 5)  # recharge exist so at least 20%
+    index_2 = index[0].tolist()
+    index_2.insert(0, 0)
+    index_2.insert(-1, -1)
+
+    my_data = np.nan_to_num(NO_max.values[:, :-9])
+
+    # %
+    snapshot = []
+    for i in range(len(index_2) - 2):
+        snapshot.append(my_data[index_2[i]:index_2[i + 1], :])
+
+    # %
+    del_index = []
+    for i in range(len(snapshot)):
+        length = len(snapshot[i])
+        if length <= ava_len :
+            del_index.append(i)
+        else:
+            pass
+
+    for i in range(len(del_index)):
+        del snapshot[del_index[i] - i]  # del snapshot that less than 100
+
+    return snapshot
+
+
+
+#%%
+# data=np.load('4-SOC_prediction/car_data.npy',allow_pickle=True)
+data=np.load('4-SOC_prediction/car_data_B.npy',allow_pickle=True)
+
+car_data1=data[0]
+car_data2=data[1]
+car_data3=data[2]
+car_data4=data[3]
+car_data5=data[4]
+
+
+snapshot1=process_data(car_data1,10,90,180)
+snapshot2=process_data(car_data2,10,90,180)
+snapshot3=process_data(car_data3,10,90,180)
+snapshot4=process_data(car_data4,10,90,180)
+snapshot5=process_data(car_data5,10,90,180)
+#%%
+"""MCS"""
+np.random.seed(42)
+random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+def monte_carlo_sampling(lst, num_samples):
+    rand_idx = np.random.choice(len(lst), num_samples, replace=False)
+    samples = [lst[i] for i in rand_idx]
+    # 在原始list中删除采样样本
+    lst = [item for i, item in enumerate(lst) if i not in rand_idx]
+
+    return samples,lst
+
+num_samples=20
+
+samples1, lst1 = monte_carlo_sampling(snapshot1, num_samples)
+samples2, lst2 = monte_carlo_sampling(snapshot2, num_samples)
+samples3, lst3 = monte_carlo_sampling(snapshot3, num_samples)
+samples4, lst4 = monte_carlo_sampling(snapshot4, num_samples)
+samples5, lst5 = monte_carlo_sampling(snapshot5, num_samples)
+
+#%%
+# snapshot=snapshot1+snapshot2+snapshot3+snapshot4+snapshot5
+snapshot=lst1+lst2+lst3+lst4+lst5
+"""打乱5辆车"""
+np.random.seed(42)
+random.seed(42)
+random.shuffle(snapshot)
+data=np.vstack(snapshot)
+data_no_time=data[:,1:].astype(float)
+
+
+#%%
+
+with open('4-SOC_prediction/models/coFUN_A.pkl', 'rb') as file:
+    efficiency_matrix_A = pickle.load(file)
+
+with open('4-SOC_prediction/models/coFUN_B.pkl', 'rb') as file:
+    efficiency_matrix_B = pickle.load(file)
+
+
+def ECR_A(speed, soc):
+    if speed <= 110 and soc >= 10 and soc <= 90:
+        return efficiency_matrix_A[speed, soc - 10]  # Return the average efficiency if outside the range
+    else:
+        return np.mean(efficiency_matrix_A)
+
+
+def ECR_B(speed, soc):
+    if speed <= 122 and soc >= 10 and soc <= 90:
+        return efficiency_matrix_B[speed, soc - 10]  # Return the average efficiency if outside the range
+    else:
+        return np.mean(efficiency_matrix_B)
+# %%
+Capacity_A = 60
+Capacity_B = 87
+ave_ECR_A=0.21
+ave_ECR_B=0.22
+Range_limt_A=270
+Range_limt_B=360
+#%%
+def feature_formation(snapshot, ave_EC, Capacity, limt, coFUN):
+    """feature formation"""
+
+    """(0)RDR"""
+    R = []
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:].astype(float)  # exclude timestamp and first/last point
+        r = (temp[-1, 5] - temp[:, 5] + temp[-1, 8] * Capacity / ave_EC / 100)
+
+        R.append(r)  # no estimated res
+
+    RDR = np.hstack(R)
+    indices = np.where(RDR > limt)
+
+    RDR = np.delete(RDR, indices[0], axis=0)
+    RDR_mean = np.mean(RDR)
+    RDR_std = np.std(RDR)
+    RDR_Z = (RDR - RDR_mean) / RDR_std
+    #
+    """(1)speed"""
+    SP = []
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:]  # exclude timestamp and first/last point
+        speed = temp[:, 1].astype(float)
+        zeros_idx = np.where(speed == 0)[0]
+        for idx in zeros_idx:
+            # 找到前后不为0的值所在位置
+            left_idx = idx - 1
+            while left_idx >= 0 and speed[left_idx] == 0:
+                left_idx -= 1
+            right_idx = idx + 1
+            while right_idx < len(speed) and speed[right_idx] == 0:
+                right_idx += 1
+            # 如果前后都有非0值，则进行插值替换
+            if left_idx >= 0 and right_idx < len(speed):
+                x = np.array([left_idx, right_idx])
+                y = speed[x]
+                speed[idx] = lagrange(x, y)(idx)
+
+        SP.append(speed)  #
+
+    SP = np.hstack(SP)
+    SP = np.delete(SP, indices[0], axis=0)
+    SP_mean = np.mean(SP)
+    SP_std = np.std(SP)
+    SP_Z = (SP - SP_mean) / SP_std
+    #
+
+    """(2)SOC  ni linspace"""
+    S = []
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:]  # exclude timestamp and first/last point
+        s = temp[:, 8].astype(float)
+
+        S.append(s)  #
+
+    SOC = np.hstack(S)
+    SOC = np.delete(SOC, indices[0], axis=0)
+
+    SOC_Z = SOC/100
+
+    #
+    """(3)SOH"""
+    M = []
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:]  # exclude timestamp and first/last point
+        m = 0.8 + 0.2 * (1 - temp[:, 5] / 1500000)
+        M.append(m)  #
+    SOH = np.hstack(M)
+    SOH = np.delete(SOH, indices[0], axis=0)
+
+    SOH_Z = SOH
+
+    """(4)SOE"""
+    SOE_Z = SOC/100 * SOH
+
+    #
+    """(5)ECR"""
+    if coFUN == 1:
+        func = ECR_A
+    else:
+        func = ECR_B
+    ecr = []
+    for i in range(len(SP)):
+        ecr.append(func(np.ceil(SP.reshape(-1, 1)[i]).astype(int), SOC.reshape(-1, 1)[i].astype(int)))
+
+    ECR = np.hstack(ecr)
+
+    ECR_mean = np.mean(ECR, axis=0)
+    ECR_std = np.std(ECR, axis=0)
+    ECR_Z = (ECR - ECR_mean) / ECR_std
+    #
+    """(6)auxiliary info"""
+    A = []  # 电压电流 单体最大最小电压 最大最小温度
+    for i in range(len(snapshot)):
+        temp = snapshot[i][1:-1, 1:]  # exclude timestamp and first/last point
+        a = temp[:, [6, 7, 16, 19, 22, 25]].astype(float)
+        A.append(a)  # no estimated res
+
+    AU = np.vstack(A)
+    AU = np.delete(AU, indices[0], axis=0)
+    AU_mean = np.mean(AU, axis=0)
+    AU_std = np.std(AU, axis=0)
+    AU_Z = (AU - AU_mean) / AU_std
+
+    # Construct the feature matrix
+    Data_set = np.concatenate((RDR_Z.reshape(-1, 1),
+                               ECR_Z.reshape(-1, 1),
+                               SOE_Z.reshape(-1, 1),
+                               SOH_Z.reshape(-1, 1),
+                               SOC_Z.reshape(-1, 1),
+                               SP_Z.reshape(-1, 1),
+                               AU_Z), axis=1).astype(float)
+
+    return Data_set,RDR_std,RDR_mean
+
+#%%
+Data_set,_,_ = feature_formation(snapshot, ave_ECR_A, Capacity_A, Range_limt_A, 1)
+# Data_set,_,_ = feature_formation(snapshot, ave_ECR_B, Capacity_B, Range_limt_B, 2)
+
+# %%
+# set seed for reproductive 42 is the answer to the universe
+"""hyper paras:"""
+np.random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+
+train_size=int(0.9*len(Data_set))
+seq_len=1 #14+1
+pre_len=1
+
+
+#%%
+#NOTE testset indicate the validation
+trainX=torch.tensor(Data_set[:train_size,1:]).unsqueeze(2).float()
+trainY=torch.tensor(Data_set[:train_size,0]).unsqueeze(1).unsqueeze(2).float()
+testX=torch.tensor(Data_set[train_size+1:,1:]).unsqueeze(2).float()
+testY=torch.tensor(Data_set[train_size+1:,0]).unsqueeze(1).unsqueeze(2).float()
+
+trainX, trainY = np.array(trainX).squeeze(), np.array(trainY).squeeze()
+
+testX, testY = np.array(testX).squeeze(), np.array(testY).squeeze()
+
+#%%
+"""according to the reference, random sample for 10 subsample"""
+
+num_arrays = 15
+sample_ratio = 1 / num_arrays
+# 生成随机采样的索引
+sample_size = int(len(trainX) * sample_ratio)
+sample_indices = np.random.randint(0, len(trainX), size=(num_arrays, sample_size))
+
+# 初始化新的数组列表
+sub_trainX= []
+sub_trainY=[]
+# 根据采样索引，从原数组中取出对应的子集
+for indices in sample_indices:
+    arrayX = np.take(trainX, indices, axis=0)
+    arrayY = np.take(trainY, indices, axis=0)
+    sub_trainX.append(arrayX)
+    sub_trainY.append(arrayY)
+
+
+# 将列表中的数组转换为NumPy数组
+sub_trainX= np.array(sub_trainX)
+sub_trainY = np.array(sub_trainY)
+#%%
+start = time.time()
+XGB_params = {'learning_rate': 0.1, 'n_estimators': 100,
+              'max_depth': 1, 'min_child_weight': 2, 'seed': 42,
+              'objective': 'reg:squarederror', 'subsample': 0.99,
+              'colsample_bytree': 0.8, 'gamma': 0,
+              'reg_alpha': 0.1, 'reg_lambda': 0.01}
+
+Bagging_XGB = []
+
+
+
+for i in range(num_arrays):
+    XGB = xgb.XGBRegressor(**XGB_params)
+    Trained_XGB = XGB.fit(sub_trainX[i, :, :], sub_trainY[i, :].reshape(-1, 1))
+    Bagging_XGB.append(Trained_XGB)
+
+
+end = time.time()
+
+print (str(end-start))
+#%%
+# joblib.dump(Bagging_XGB, '4-SOC_prediction/models/Bagging_XGB.pkl')
+# joblib.dump(Bagging_XGB, '4-SOC_prediction/models/Bagging_XGB_B.pkl')
+#load model
+# Bagging_XGB = joblib.load('4-SOC_prediction/models/Bagging_XGB.pkl')
+#%%
+"""XGB"""
+
+# Bagging_XGB = joblib.load('4-SOC_prediction/models/Bagging_XGB.pkl')
+Bagging_XGB_B = joblib.load('4-SOC_prediction/models/Bagging_XGB_B.pkl')
+
+#%%
+start = time.time()
+"""prediction"""
+
+sample_snapshot=samples1+samples2+samples3+samples4+samples5
+
+
+# car,RDR_std,RDR_mean = feature_formation(sample_snapshot, ave_ECR_A, Capacity_A, Range_limt_A, 1)
+car,RDR_std,RDR_mean = feature_formation(sample_snapshot, ave_ECR_B, Capacity_B, Range_limt_B, 2)
+
+
+trainX1 = torch.tensor(car[:, 1:]).unsqueeze(2).float()
+trainY1 = torch.tensor(car[:, 0]).unsqueeze(1).unsqueeze(2).float()
+
+X, Y = np.array(trainX1).squeeze(), np.array(trainY1).squeeze()
+
+# num_arrays=15
+num_arrays=20
+
+sum_pred = 0
+for i in range(num_arrays):
+    # sum_pred += Bagging_XGB[i].predict(X)
+    sum_pred += Bagging_XGB_B[i].predict(X)
+
+Norm_pred = sum_pred / num_arrays
+
+Preds = Norm_pred.reshape(-1, 1) * RDR_std + RDR_mean
+
+GT = Y.reshape(-1, 1) * RDR_std + RDR_mean
+
+
+
+end = time.time()
+
+print ((end-start)/len(GT)*100000)
+evaluation(GT, Preds)
+#%%
+
+#%% train
+"search paras"
+N_values = [20,40,60,80,100]
+LR_values = [ 5,10,15,20]
+results = {}
+
+# Loop through different combinations of N and LR
+for N in N_values:
+    for LR in LR_values:
+        XGB_params = {'learning_rate': 0.1, 'n_estimators': N,
+                      'max_depth': 1, 'min_child_weight': 2, 'seed': 42,
+                      'objective': 'reg:squarederror', 'subsample': 0.99,
+                      'colsample_bytree': 0.8, 'gamma': 0,
+                      'reg_alpha': 0.1, 'reg_lambda': 0.01}
+
+
+        Bagging_XGB = []
+
+        num_arrays = LR
+        sample_ratio = 1 / num_arrays
+        # 生成随机采样的索引
+        sample_size = int(len(trainX) * sample_ratio)
+        sample_indices = np.random.randint(0, len(trainX), size=(num_arrays, sample_size))
+
+        # 初始化新的数组列表
+        sub_trainX = []
+        sub_trainY = []
+        # 根据采样索引，从原数组中取出对应的子集
+        for indices in sample_indices:
+            arrayX = np.take(trainX, indices, axis=0)
+            arrayY = np.take(trainY, indices, axis=0)
+            sub_trainX.append(arrayX)
+            sub_trainY.append(arrayY)
+
+        # 将列表中的数组转换为NumPy数组
+        sub_trainX = np.array(sub_trainX)
+        sub_trainY = np.array(sub_trainY)
+
+        for i in range(num_arrays ):
+            XGB = xgb.XGBRegressor(**XGB_params)
+            Trained_XGB = XGB.fit(sub_trainX[i, :, :], sub_trainY[i, :].reshape(-1, 1))
+
+            Bagging_XGB.append(Trained_XGB)
+
+        sum_pred = 0
+        for i in range(num_arrays ):
+            sum_pred += Bagging_XGB[i].predict(X)
+
+        """prediction"""
+        Norm_pred = sum_pred / num_arrays
+
+        Preds = Norm_pred.reshape(-1, 1) * RDR_std + RDR_mean
+
+
+        GT = Y.reshape(-1, 1) * RDR_std + RDR_mean
+
+        evaluation_score = evaluation(GT, Preds)[0]
+        results[(N, LR)] = evaluation_score
+
+print('finish')
+#%%
+# Extract the values from the dictionary
+evaluation_scores = list(results.values())
+
+# Convert the list to a NumPy array
+evaluation_array = np.array(evaluation_scores)
+
+# Reshape the array into a 4x5 array
+AResult_array = evaluation_array.reshape(5,4).T
+AResult_array
+
+#%%
+
+
